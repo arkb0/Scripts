@@ -1,0 +1,13 @@
+Hello
+Bonjour
+Hola amiga
+print('Python script')
+function Test() { return false; }
+Roses are green
+Violets are blue
+La vie en rose
+One two four
+SpAm eGGs foO bAr
+Extra line
+Another one
+End

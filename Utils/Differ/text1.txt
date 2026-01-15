@@ -1,0 +1,11 @@
+Hello
+Bonjour
+Hola amigo
+print('Python code')
+function test() { return true; }
+Roses are red
+Violets are blue
+C'est la vie
+One two three
+spam eggs foo bar
+End
