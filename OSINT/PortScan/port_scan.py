@@ -10,13 +10,20 @@ import sys
 # Provides the ability to create, manipulate, and validate IPv4 and IPv6 addresses
 import ipaddress  # Standard library for IP manipulation
 # Import type hinting markers to improve code readability and static analysis
-from typing import List, Dict
+from typing import List, Dict, Optional
 # Used for generating timestamps within the report metadata
 from datetime import datetime
 # Facilitates concurrent execution using a pool of threads to speed up the scanning process
 from concurrent.futures import ThreadPoolExecutor, as_completed
+# prevent To conditions race (to prevent race conditions)
+import threading
 # Facilitates the reading and writing of tabular data in Comma Separated Values format
 import csv
+# For stealth measures
+import random
+import time
+# To allow undecorated function calls
+from functools import wraps
 
 # Attempt to load the PDF generation library; handle the error gracefully if it is missing
 try:
@@ -24,6 +31,73 @@ try:
 except ImportError:
   print('⚠️  FPDF not installed. Install with: `pip install fpdf`')
   print('CSV report will still be generated.')
+
+# Constants
+NUM_PARALLEL_WORKERS = 20
+# De-botifying jitter
+JITTER_MIN = 0.1
+JITTER_MAX = 0.5
+# Backoff after so many failures
+BACKOFF_THRESH = 10
+# Backoff randomly for a (min, max) range of seconds
+BACKOFF_MIN_WAIT = 15
+BACKOFF_MAX_WAIT = 30
+# Timeout values in seconds for scouting and full scans
+SCOUTING_TIMEOUT = 0.5
+SCAN_TIMEOUT = 1
+
+# Create a global lock object for synchronising threads
+# This ensures that our streak counter doesn't suffer from race conditions
+scanner_lock = threading.Lock()
+
+# Stealth measures
+def adaptive_timing(func):
+  '''
+  A decorator to implement Jitter and Adaptive Back-off.
+  This ensures the traffic profile looks less robotic and responds to throttling.
+  '''
+  @wraps(func) # Enables .__wrapped__
+  def wrapper(self, *args, **kwargs):
+    # Introduce 'Jitter' (0.1s to 0.5s) to vary the request cadence
+    time.sleep(random.uniform(JITTER_MIN, JITTER_MAX))
+    
+    # Adaptive Timing Logic
+    # Need a lock here to make this thread-safe
+    # Only one thread should check/increment the streak at a time
+    with scanner_lock:
+      # If the scanner has hit too many consecutive timeouts, pause for a random duration between 15 and 30 seconds to let the network cool down
+      if getattr(self, 'error_streak', 0) > BACKOFF_THRESH:
+        # Calculate a random sleep interval to make the back-off period less predictable
+        wait_time = random.randint(BACKOFF_MIN_WAIT, BACKOFF_MAX_WAIT)
+        print(f'\n⚠️  Possible throttling detected (Error streak: {self.error_streak}). Backing off for {wait_time}s...')
+        # Waiting while holding the lock is deliberate - it is effectively a global cool-down (extra stealth)
+        time.sleep(wait_time)
+        # Reset the streak counter to allow the scanner to resume with a fresh state
+        self.error_streak = 0
+        # We return here or skip the scan to prevent immediate re-triggering
+        return None # Abort this specific port scan attempt
+      
+    # Perform the actual task
+    result = func(self, *args, **kwargs)
+    
+    # Re-acquire the lock to safely update the shared state
+    with scanner_lock:
+      # If the result is a dictionary, it's an 'Open' port
+      if isinstance(result, dict):
+        self.error_streak = 0
+      
+      # If the result is 'BLOCKED', increment the streak (this is the stealth trigger)
+      elif result == 'BLOCKED':
+        self.error_streak = getattr(self, 'error_streak', 0) + 1
+      
+      # If the result is 'CLOSED', we do nothing to the streak. 
+      # The host responded, so we aren't necessarily being throttled.
+      elif result == 'CLOSED':
+        pass 
+
+    # Return only the dictionary (or None) to keep the rest of the script compatible
+    return result if isinstance(result, dict) else None
+  return wrapper
 
 class PortScanner:
   # Common ports and services
@@ -65,12 +139,15 @@ class PortScanner:
   }
 
   # Initialise the scanner with a custom timeout for connection attempts
-  def __init__(self, timeout: int = 1):
+  def __init__(self, timeout: int = SCAN_TIMEOUT):
     self.timeout = timeout
     self.results = []
+    # Track the state of failures for the adaptive timing decorator
+    self.error_streak = 0
 
-  def scan_port(self, ip:str, port: int) -> Dict:
-    '''Scan a single port'''
+  @adaptive_timing
+  def scan_port(self, ip: str, port: int) -> Optional[Dict]:
+    '''Scan a single port with timing logic applied via the decorator.'''
     try:
       # Establish a standard Internet stream socket (TCP)
       sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -90,22 +167,78 @@ class PortScanner:
           'status': 'Open',
           'service': service
         }
+      
+      # Check specific error codes if connect_ex didn't return 0
+      # 111 is usually Connection Refused (Linux), 10061 (Windows)
+      if result in (111, 10061):
+        # This is a 'Closed' port - the host is there, but nothing is listening
+        return 'CLOSED'
+
+    except socket.timeout:
+      # This is a 'Blocked/Filtered' port - a firewall likely dropped the packet
+      # We return a specific marker or simply None, but the decorator 
+      # should ideally only track THESE as errors.
+      return 'BLOCKED'
     except socket.error:
-      pass
-    return None
+      return 'BLOCKED'
+    finally:
+      # Safety check: only call close if the socket was actually created
+      if sock:
+        sock.close()
+    return 'BLOCKED'
 
   def scan_host(self, ip: str, ports: List[int] = None) -> List[Dict]:
-    '''Scan all ports for a host'''
+    '''Standard host scan, now benefitting from the decorated port scan.'''
     if ports is None:
       # Scan common ports
       # If no specific ports are provided, default to the predefined common service ports
       ports = list(self.COMMON_PORTS.keys())
 
+    # --- SCOUT CHECK ---
+    # We check one very common port (e.g., 80) first.
+    # Note: We bypass the decorator here to avoid incrementing the streak 
+    # for a host that might just have port 80 closed but others open.
+    # We just want to see if we get a 'CLOSED' (Refused) vs 'BLOCKED' (Timeout).
+    
+    print(f'Checking if {ip} is alive...')
+    # Scout a few common ports to be sure
+    # 80 (Web), 443 (SSL), 22 (SSH), 445 (Windows SMB)
+    scout_ports = [80, 443, 22, 445]
+    is_alive = False
+
+    # Save original timeout to restore it later
+    original_timeout = self.timeout
+
+    # FAST SCOUT: Set a very short timeout for the scout (e.g., 0.5s)
+    # This speeds up skipping dead hosts significantly.
+    self.timeout = SCOUTING_TIMEOUT
+    
+    # Simple check: If we get 'Open' OR 'Closed' (Refused), the host is alive.
+    # If we get 'Blocked' (Timeout), we assume the host is down/filtered.
+    for p in scout_ports:
+      # Use the undecorated function (.__wrapped__) for scouting
+      # So that it doesn't trip the global throttling back-off.
+      status = self.scan_port.__wrapped__(self, ip, p) # Bypass the decorator - needs the explicit `self` too
+      # If any port is Open (dict) or Closed (str 'CLOSED'), the host is UP
+      if isinstance(status, dict) or status == 'CLOSED':
+        is_alive = True
+        break # Success! Stop scouting and start the real scan
+    
+    # Restore the original timeout for the actual full scan
+    self.timeout = original_timeout
+
+    if not is_alive:
+      print(f'⏩ Skipping {ip} (No response on scout port(s)).')
+      return []
+
+    # --- FULL SCAN ---
+    # If the host is alive, proceed with the full multi-threaded scan
     open_ports = []
     print(f'Scanning {ip} ...')
 
     # Use a thread pool to dispatch multiple connection requests simultaneously
-    with ThreadPoolExecutor(max_workers = 50) as executor:
+    # A lower threadpool worker count complements the jitter logic
+    with ThreadPoolExecutor(max_workers = NUM_PARALLEL_WORKERS) as executor:
       # Map the scan function across the list of ports to be checked
       futures = {
         executor.submit(self.scan_port, ip, port): port
@@ -118,45 +251,56 @@ class PortScanner:
         if result:
           open_ports.append(result)
 
+    # Reset the streak at the end of the host scan so the next host 
+    # starts with a clean slate.
+    with scanner_lock:
+      self.error_streak = 0
+
     return open_ports
   
   def scan_range(self, start_ip: str, end_ip: str, ports: List[int] = None) -> List[Dict]:
-    '''Scan a range of IPs'''
+    '''Scan a range of IPs using a randomised order'''
     all_results = []
 
     try:
-        # Determine the actual end IP
-        # Logic: If end_ip is just a number (e.g., '10'), build it from start_ip's prefix
-        if end_ip.isdigit():
-            # Split the starting IP to retrieve the first three octets
-            base_parts = start_ip.split('.')
-            # Replace the final octet with the provided shorthand number
-            base_parts[-1] = end_ip
-            end_ip_str = '.'.join(base_parts)
-        else:
-            end_ip_str = end_ip
+      # Determine the actual end IP
+      # Logic: If end_ip is just a number (e.g., '10'), build it from start_ip's prefix
+      if end_ip.isdigit():
+        # Split the starting IP to retrieve the first three octets
+        base_parts = start_ip.split('.')
+        # Replace the final octet with the provided shorthand number
+        base_parts[-1] = end_ip
+        end_ip_str = '.'.join(base_parts)
+      else:
+        end_ip_str = end_ip
 
-        # Leverage ipaddress to calculate the range sequence
-        # Convert string representations into formal IPv4Address objects for comparison and iteration
-        start_addr = ipaddress.IPv4Address(start_ip)
-        end_addr = ipaddress.IPv4Address(end_ip_str)
+      # Leverage ipaddress to calculate the range sequence
+      # Convert string representations into formal IPv4Address objects for comparison and iteration
+      start_addr = ipaddress.IPv4Address(start_ip)
+      end_addr = ipaddress.IPv4Address(end_ip_str)
 
-        # Ensure range is valid (start <= end)
-        # Prevent the logic from executing if the range is logically reversed
-        if start_addr > end_addr:
-            print(f"❌ Error: Start IP {start_addr} is greater than End IP {end_addr}")
-            return []
+      # Ensure range is valid (start <= end)
+      # Prevent the logic from executing if the range is logically reversed
+      if start_addr > end_addr:
+        print(f'❌ Error: Start IP {start_addr} is greater than End IP {end_addr}')
+        return []
+      
+      # Generate the full list of IP strings in the range
+      ip_pool = [
+        str(ipaddress.IPv4Address(ip_int)) 
+        for ip_int in range(int(start_addr), int(end_addr) + 1)
+      ]
 
-        # Iterate through the range
-        # Treat the IP addresses as integers to allow for simple mathematical iteration
-        for ip_int in range(int(start_addr), int(end_addr) + 1):
-            # Convert the integer back to a standard string-based IP format
-            ip_str = str(ipaddress.IPv4Address(ip_int))
-            results = self.scan_host(ip_str, ports)
-            all_results.extend(results)
+      # Shuffle the list so the scan pattern is non-linear
+      random.shuffle(ip_pool)
+
+      # Iterate through the randomised pool
+      for ip_str in ip_pool:
+        results = self.scan_host(ip_str, ports)
+        all_results.extend(results)
 
     except ValueError as e:
-        print(f"❌ Invalid IP Format: {e}")
+      print(f'❌ Invalid IP Format: {e}')
     
     return all_results
 
@@ -228,20 +372,6 @@ class PortScanner:
     except Exception as e:
       print(f'❌ Error generating PDF: {e}')
 
-
-'''
-FUTURE WORK
-
-A. Randomise the Scan Order
-Instead of scanning .1, .2, .3..., shuffle the list of IPs. Firewalls look for sequential hits.
-
-B. Implement Jitter and Latency
-Scanning 50 ports simultaneously is efficient but loud. Adding a small, random delay (jitter) between requests makes the traffic look more human.
-
-C. Adaptive Timing
-Several Connection Refused or Timeout errors in a row => the firewall has likely throttled you.
-'''
-
 # Driver
 # The main entry point for the script execution
 def main():
@@ -262,7 +392,7 @@ def main():
         # Use the first and last address of the subnet to feed scan_range
         results = scanner.scan_range(str(network[0]), str(network[-1]))
       except ValueError as e:
-        print(f"❌ Invalid CIDR format: {e}")
+        print(f'❌ Invalid CIDR format: {e}')
         sys.exit(1)
 
     # Existing Range Logic (e.g., 192.168.1.1-10)
